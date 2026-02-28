@@ -263,15 +263,6 @@ ls -la | sgpt "which files are largest"
 sgpt "explain this code" < script.py
 ```
 
-### Aliases you have set up
-```bash
-ai    # = ollama run mistral (interactive chat)
-ask   # = ollama run mistral (interactive chat)
-s     # = sgpt (inline query)
-ss    # = sgpt --shell (shell command mode)
-ai-env # = activates the Python venv for fine-tuning
-```
-
 ### sgpt vs ollamactl ask vs ollama run
 
 | Tool | Use case |
@@ -308,7 +299,16 @@ alias ai-env='source ~/.venv/ai/bin/activate'
 
 # Makes pipx-installed tools available (sgpt lives here)
 export PATH="$HOME/.local/bin:$PATH"
+
 ```
+
+### Aliases you have set up
+```bash
+ai    # = ollama run mistral (interactive chat)
+ask   # = ollama run mistral (interactive chat)
+s     # = sgpt (inline query)
+ss    # = sgpt --shell (shell command mode)
+ai-env # = activates the Python venv for fine-tuning
 
 To edit your zshrc: `nvim ~/.zshrc`
 To reload after edits: `source ~/.zshrc`
