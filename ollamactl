@@ -1,0 +1,432 @@
+#!/usr/bin/env bash
+# ollamactl — Ollama management script
+# Usage: ollamactl [command] [options]
+
+set -euo pipefail
+
+# ─── Config ────────────────────────────────────────────────────────────────────
+OLLAMA_BIN="/usr/local/bin/ollama"
+OLLAMA_SERVICE="ollama"
+DEFAULT_MODEL="mistral"
+CONFIG_FILE="$HOME/.config/ollamactl/config"
+LOG_FILE="$HOME/.local/share/ollamactl/ollamactl.log"
+HISTORY_FILE="$HOME/.local/share/ollamactl/history.log"
+
+# ─── Colors ────────────────────────────────────────────────────────────────────
+RED='\033[0;31m'
+GRN='\033[0;32m'
+YLW='\033[0;33m'
+BLU='\033[0;34m'
+CYN='\033[0;36m'
+BOLD='\033[1m'
+DIM='\033[2m'
+RST='\033[0m'
+
+# ─── Helpers ───────────────────────────────────────────────────────────────────
+info()    { echo -e "${BLU}[INFO]${RST}  $*"; }
+ok()      { echo -e "${GRN}[OK]${RST}    $*"; }
+warn()    { echo -e "${YLW}[WARN]${RST}  $*"; }
+err()     { echo -e "${RED}[ERR]${RST}   $*" >&2; }
+die()     { err "$*"; exit 1; }
+hr()      { echo -e "${DIM}────────────────────────────────────────────────────${RST}"; }
+
+require() {
+    command -v "$1" &>/dev/null || die "'$1' not found. Install it first."
+}
+
+ensure_dirs() {
+    mkdir -p "$(dirname "$CONFIG_FILE")" "$(dirname "$LOG_FILE")"
+}
+
+load_config() {
+    ensure_dirs
+    if [[ -f "$CONFIG_FILE" ]]; then
+        source "$CONFIG_FILE"
+    fi
+    DEFAULT_MODEL="${OLLAMACTL_MODEL:-$DEFAULT_MODEL}"
+}
+
+save_config() {
+    ensure_dirs
+    cat > "$CONFIG_FILE" <<EOF
+OLLAMACTL_MODEL="${DEFAULT_MODEL}"
+EOF
+    ok "Config saved to $CONFIG_FILE"
+}
+
+log() {
+    ensure_dirs
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$LOG_FILE"
+}
+
+# ─── Service Control ───────────────────────────────────────────────────────────
+cmd_start() {
+    info "Starting Ollama service..."
+    if systemctl --user is-active "$OLLAMA_SERVICE" &>/dev/null || \
+       systemctl is-active "$OLLAMA_SERVICE" &>/dev/null; then
+        ok "Ollama is already running."
+        return
+    fi
+    if systemctl start "$OLLAMA_SERVICE" 2>/dev/null || \
+       systemctl --user start "$OLLAMA_SERVICE" 2>/dev/null; then
+        ok "Ollama started via systemd."
+    else
+        warn "systemd failed — starting manually in background..."
+        nohup "$OLLAMA_BIN" serve >> "$LOG_FILE" 2>&1 &
+        sleep 1
+        ok "Ollama started (PID: $!)."
+    fi
+    log "start command executed"
+}
+
+cmd_stop() {
+    info "Stopping Ollama service..."
+    if systemctl stop "$OLLAMA_SERVICE" 2>/dev/null || \
+       systemctl --user stop "$OLLAMA_SERVICE" 2>/dev/null; then
+        ok "Ollama stopped via systemd."
+    else
+        local pid
+        pid=$(pgrep -f "ollama serve" || true)
+        if [[ -n "$pid" ]]; then
+            kill "$pid" && ok "Ollama process ($pid) killed."
+        else
+            warn "Ollama doesn't appear to be running."
+        fi
+    fi
+    log "stop command executed"
+}
+
+cmd_restart() {
+    info "Restarting Ollama..."
+    cmd_stop
+    sleep 1
+    cmd_start
+}
+
+cmd_status() {
+    hr
+    echo -e "${BOLD}  Ollama Status${RST}"
+    hr
+
+    if pgrep -f "ollama serve" &>/dev/null; then
+        echo -e "  Service    : ${GRN}● Running${RST}"
+        echo -e "  PID        : $(pgrep -f 'ollama serve')"
+    else
+        echo -e "  Service    : ${RED}○ Stopped${RST}"
+    fi
+
+    if curl -sf http://localhost:11434 &>/dev/null; then
+        echo -e "  API        : ${GRN}● Reachable${RST} (http://localhost:11434)"
+    else
+        echo -e "  API        : ${RED}● Unreachable${RST}"
+    fi
+
+    echo -e "  Default    : ${CYN}${DEFAULT_MODEL}${RST}"
+
+    hr
+    echo -e "${BOLD}  Loaded Models${RST}"
+    hr
+    "$OLLAMA_BIN" ps 2>/dev/null || echo "  (none)"
+
+    hr
+    echo -e "${BOLD}  GPU Info${RST}"
+    hr
+    if command -v nvidia-smi &>/dev/null; then
+        nvidia-smi --query-gpu=name,temperature.gpu,utilization.gpu,memory.used,memory.total,power.draw \
+            --format=csv,noheader,nounits 2>/dev/null | \
+        awk -F', ' '{
+            printf "  GPU        : %s\n", $1
+            printf "  Temp       : %s°C\n", $2
+            printf "  GPU Util   : %s%%\n", $3
+            printf "  VRAM       : %s MiB / %s MiB\n", $4, $5
+            printf "  Power      : %s W\n", $6
+        }'
+    else
+        warn "nvidia-smi not found."
+    fi
+    hr
+}
+
+# ─── Model Management ──────────────────────────────────────────────────────────
+cmd_models() {
+    hr
+    echo -e "${BOLD}  Downloaded Models${RST}"
+    hr
+    "$OLLAMA_BIN" list
+    hr
+    echo -e "${BOLD}  Currently Loaded (in VRAM/RAM)${RST}"
+    hr
+    "$OLLAMA_BIN" ps
+}
+
+cmd_pull() {
+    local model="${1:-}"
+    [[ -z "$model" ]] && die "Usage: ollamactl pull <model>"
+    info "Pulling model: $model"
+    "$OLLAMA_BIN" pull "$model"
+    ok "Model '$model' ready."
+    log "pulled model: $model"
+}
+
+cmd_remove() {
+    local model="${1:-}"
+    [[ -z "$model" ]] && die "Usage: ollamactl remove <model>"
+    warn "This will delete '$model'. Are you sure? [y/N] "
+    read -r confirm
+    [[ "$confirm" =~ ^[Yy]$ ]] || { info "Aborted."; return; }
+    "$OLLAMA_BIN" rm "$model"
+    ok "Model '$model' removed."
+    log "removed model: $model"
+}
+
+cmd_set_model() {
+    local model="${1:-}"
+    [[ -z "$model" ]] && die "Usage: ollamactl set-model <model>"
+    DEFAULT_MODEL="$model"
+    save_config
+    ok "Default model set to: $model"
+}
+
+# ─── GPU Control ───────────────────────────────────────────────────────────────
+cmd_gpu() {
+    local sub="${1:-status}"
+    case "$sub" in
+        status)
+            require nvidia-smi
+            nvidia-smi
+            ;;
+        watch)
+            require nvidia-smi
+            info "Watching GPU every 2s (Ctrl+C to stop)..."
+            watch -n2 'nvidia-smi --query-gpu=name,temperature.gpu,utilization.gpu,memory.used,memory.total,power.draw --format=csv,noheader,nounits | awk -F", " "{printf \"GPU: %s | Temp: %s°C | Util: %s%% | VRAM: %s/%s MiB | Power: %sW\n\", \$1,\$2,\$3,\$4,\$5,\$6}"'
+            ;;
+        layers)
+            local n="${2:-}"
+            if [[ -z "$n" ]]; then
+                echo -e "Current OLLAMA_NUM_GPU: ${CYN}${OLLAMA_NUM_GPU:-auto}${RST}"
+                echo ""
+                echo "Usage: ollamactl gpu layers <number>"
+                echo "  0        = CPU only (no GPU)"
+                echo "  1-33     = Partial GPU offload (mistral has 33 layers)"
+                echo "  99/auto  = Max GPU offload (default)"
+                return
+            fi
+            export OLLAMA_NUM_GPU="$n"
+            local shell_rc="$HOME/.zshrc"
+            [[ -f "$HOME/.bashrc" ]] && shell_rc="$HOME/.bashrc"
+            if grep -q "OLLAMA_NUM_GPU" "$shell_rc" 2>/dev/null; then
+                sed -i "s/export OLLAMA_NUM_GPU=.*/export OLLAMA_NUM_GPU=$n/" "$shell_rc"
+            else
+                echo "export OLLAMA_NUM_GPU=$n" >> "$shell_rc"
+            fi
+            ok "GPU layers set to $n — restart Ollama and re-run your model to apply."
+            ok "Also written to $shell_rc"
+            log "gpu layers set to $n"
+            ;;
+        reset)
+            sed -i '/OLLAMA_NUM_GPU/d' "$HOME/.zshrc" 2>/dev/null || true
+            sed -i '/OLLAMA_NUM_GPU/d' "$HOME/.bashrc" 2>/dev/null || true
+            unset OLLAMA_NUM_GPU
+            ok "GPU layer override removed. Ollama will auto-detect on next run."
+            ;;
+        *)
+            die "Unknown gpu subcommand: $sub. Try: status, watch, layers, reset"
+            ;;
+    esac
+}
+
+# ─── Chat & Run ────────────────────────────────────────────────────────────────
+cmd_chat() {
+    local model="${1:-$DEFAULT_MODEL}"
+    info "Starting chat with: $model"
+    log "chat started with $model"
+    "$OLLAMA_BIN" run "$model"
+}
+
+cmd_ask() {
+    local model="$DEFAULT_MODEL"
+    local prompt=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --model|-m) model="$2"; shift 2 ;;
+            *) prompt+="$1 "; shift ;;
+        esac
+    done
+
+    [[ -z "$prompt" ]] && die "Usage: ollamactl ask [--model <model>] <your question>"
+    prompt="${prompt% }"
+
+    ensure_dirs
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [${model}] Q: $prompt" >> "$HISTORY_FILE"
+
+    local response
+    response=$(curl -sf http://localhost:11434/api/generate \
+        -H 'Content-Type: application/json' \
+        -d "{\"model\": \"$model\", \"prompt\": $(echo "$prompt" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read().strip()))'), \"stream\": false}" \
+        | python3 -c 'import json,sys; print(json.loads(sys.stdin.read())["response"])' 2>/dev/null) \
+        || die "Ollama API unreachable. Is it running? Try: ollamactl start"
+
+    echo ""
+    echo -e "${CYN}${response}${RST}"
+    echo ""
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [${model}] A: $response" >> "$HISTORY_FILE"
+}
+
+# ─── Logs & History ────────────────────────────────────────────────────────────
+cmd_logs() {
+    local n="${1:-50}"
+    if [[ -f "$LOG_FILE" ]]; then
+        info "Last $n lines from $LOG_FILE:"
+        tail -n "$n" "$LOG_FILE"
+    else
+        warn "No log file found yet."
+    fi
+}
+
+cmd_history() {
+    local n="${1:-20}"
+    if [[ -f "$HISTORY_FILE" ]]; then
+        info "Last $n entries from chat history:"
+        tail -n "$n" "$HISTORY_FILE"
+    else
+        warn "No history yet. Use 'ollamactl ask' to generate some."
+    fi
+}
+
+# ─── Fine-tuning helper ────────────────────────────────────────────────────────
+cmd_finetune() {
+    hr
+    echo -e "${BOLD}  Fine-tuning Guide for your GTX 1650 Max-Q${RST}"
+    hr
+    cat <<'EOF'
+
+  Your hardware can fine-tune small models using LoRA (Low-Rank Adaptation).
+  This lets you train the model on YOUR data without full retraining.
+
+  ── Step 1: Install Unsloth ───────────────────────────────────────────────
+  pip install unsloth --break-system-packages
+
+  ── Step 2: Prepare your dataset ─────────────────────────────────────────
+  Create a JSONL file where each line is a prompt/response pair:
+
+  {"instruction": "What is X?", "output": "X is ..."}
+  {"instruction": "How do I do Y?", "output": "You do Y by ..."}
+
+  Save it as: ~/my_dataset.jsonl
+
+  ── Step 3: Fine-tune ─────────────────────────────────────────────────────
+  Recommended base models for 4GB VRAM:
+    - unsloth/Phi-3-mini-4k-instruct
+    - unsloth/llama-3.2-3b-instruct
+    - unsloth/mistral-7b-instruct-v0.3-bnb-4bit
+
+  ── Step 4: Export to GGUF and load in Ollama ─────────────────────────────
+  After training, export with:
+    model.save_pretrained_gguf("my_model", tokenizer, quantization_method="q4_k_m")
+
+  Create a Modelfile:
+    FROM ./my_model-Q4_K_M.gguf
+    SYSTEM "You are my personal assistant..."
+
+  Import it:
+    ollama create mymodel -f Modelfile
+    ollama run mymodel
+
+EOF
+    hr
+}
+
+# ─── Help ──────────────────────────────────────────────────────────────────────
+cmd_help() {
+    cat <<EOF
+
+$(echo -e "${BOLD}  ollamactl${RST} — Local Ollama Management Script")
+$(hr)
+$(echo -e "${BOLD}  SERVICE CONTROL${RST}")
+
+    start                   Start the Ollama service
+    stop                    Stop the Ollama service
+    restart                 Restart the Ollama service
+    status                  Show service status, loaded models, and GPU info
+
+$(echo -e "${BOLD}  MODEL MANAGEMENT${RST}")
+
+    models                  List all downloaded and currently loaded models
+    pull <model>            Download a model from Ollama registry
+    remove <model>          Delete a model from disk
+    set-model <model>       Set the default model (saved to config)
+
+    Recommended for your 4GB VRAM GTX 1650 Max-Q:
+      phi3:mini             ~2.3GB  — fast, great for terminal/code
+      llama3.2:3b           ~2.0GB  — balanced, good reasoning
+      mistral               ~4.1GB  — very capable, spills to RAM
+      codellama:7b          ~3.8GB  — best for coding tasks
+
+$(echo -e "${BOLD}  GPU CONTROL${RST}")
+
+    gpu status              Full nvidia-smi output
+    gpu watch               Live GPU stats every 2 seconds
+    gpu layers [n]          Set GPU layer offload count
+                              0    = CPU only
+                              1-33 = Partial (mistral = 33 layers)
+                              99   = Full GPU (default)
+    gpu reset               Remove override, restore auto-detect
+
+$(echo -e "${BOLD}  CHAT & QUERIES${RST}")
+
+    chat [model]            Interactive chat session
+    ask [--model <m>] <q>   Single question, logged to history
+
+    Examples:
+      ollamactl ask how do I find files larger than 1GB
+      ollamactl ask --model phi3 write a python http server
+      ollamactl chat codellama
+
+$(echo -e "${BOLD}  LOGS & HISTORY${RST}")
+
+    logs [n]                Last n lines of ollamactl log (default: 50)
+    history [n]             Last n ask Q&A pairs (default: 20)
+
+$(echo -e "${BOLD}  FINE-TUNING${RST}")
+
+    finetune                Step-by-step LoRA training guide
+
+$(echo -e "${BOLD}  FILES${RST}")
+
+    Config   : ~/.config/ollamactl/config
+    Log      : ~/.local/share/ollamactl/ollamactl.log
+    History  : ~/.local/share/ollamactl/history.log
+
+$(echo -e "${BOLD}  INSTALL${RST}")
+
+    sudo cp ollamactl /usr/local/bin/ollamactl
+    sudo chmod +x /usr/local/bin/ollamactl
+
+EOF
+}
+
+# ─── Entry Point ───────────────────────────────────────────────────────────────
+load_config
+
+CMD="${1:-help}"
+shift || true
+
+case "$CMD" in
+    start)           cmd_start ;;
+    stop)            cmd_stop ;;
+    restart)         cmd_restart ;;
+    status)          cmd_status ;;
+    models)          cmd_models ;;
+    pull)            cmd_pull "$@" ;;
+    remove|rm)       cmd_remove "$@" ;;
+    set-model)       cmd_set_model "$@" ;;
+    gpu)             cmd_gpu "$@" ;;
+    chat)            cmd_chat "$@" ;;
+    ask)             cmd_ask "$@" ;;
+    logs)            cmd_logs "$@" ;;
+    history)         cmd_history "$@" ;;
+    finetune)        cmd_finetune ;;
+    help|--help|-h)  cmd_help ;;
+    *)               err "Unknown command: $CMD"; cmd_help; exit 1 ;;
+esac
