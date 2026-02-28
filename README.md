@@ -1,7 +1,7 @@
 # Ollamactl
 A complete guide to Ollama, ollamactl, and sgpt setup and use, particularly with mistral and codellama. Please be careful when following this guide as I had to troubleshoot and you may have to as well.
 
-# Local AI Setup — Arch Linux
+# Local AI Setup — (Arch Linux with intel/nvidia)
 
 ---
 
